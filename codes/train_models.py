@@ -10,9 +10,9 @@ import torch.multiprocessing
 import numpy as np
 import json
 import math
+from torch.nn import CrossEntropyLoss  # 补充导入，防止 NameError
 from utils.ade_utils import emd_inference_opencv_test
 from collections import Counter
-
 from utils.hsic import hsic_normalized_cca
 
 
@@ -64,7 +64,6 @@ def evaluate(model, dataset, config):
     key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
 
     for key in key_set:
-        # if key in key_set:
         result = result + key + "  " + str(round(test_stats[key], 4)) + "| "
     print(result)
     model.train()
@@ -76,7 +75,6 @@ def save_checkpoint(state, save_path, epoch, best=False):
     torch.save(state, filename)
 
 
-# ========conditional train=
 def rand_bbox(size, lam):
     W = size[-2]
     H = size[-1]
@@ -84,7 +82,6 @@ def rand_bbox(size, lam):
     cut_w = np.int_(W * cut_rat)
     cut_h = np.int_(H * cut_rat)
 
-    # uniform
     cx = np.random.randint(W)
     cy = np.random.randint(H)
 
@@ -109,7 +106,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     model.train()
     best_loss = 1e5
     best_metric = 0
-    Loss_fn = CrossEntropyLoss()
     log_training = open(os.path.join(config.save_path, 'log.txt'), 'w')
 
     attr2idx = train_dataset.attr2idx
@@ -133,53 +129,57 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
         for bid, batch in enumerate(train_dataloader):
+            # ---------------------------------------------------------
+            # 新版数据解包：严格获取 6 个特征 (包含双曲层次所需的粗粒度标签)
+            # ---------------------------------------------------------
+            batch_img = batch[0].cuda()
             batch_verb = batch[1].cuda()
             batch_obj = batch[2].cuda()
             batch_target = batch[3].cuda()
-            batch_img = batch[0].cuda()
+            batch_coarse_verb = batch[4].cuda()
+            batch_coarse_obj = batch[5].cuda()
+
+            # 打包给 loss_calu
+            target = [batch_img, batch_verb, batch_obj, batch_target, batch_coarse_verb, batch_coarse_obj]
+
             with torch.cuda.amp.autocast(enabled=True):
-                # ========== Modified for Ablation Study ==========
-                # Correctly unpack 3 values (verb, obj, composition)
-                p_v, p_o, f = model(batch_img)
+                # ---------------------------------------------------------
+                # 新版模型调用：使用 kwargs 传参，获取 predict 字典
+                # ---------------------------------------------------------
+                predict = model(
+                    video=batch_img,
+                    batch_verb=batch_verb,
+                    batch_obj=batch_obj,
+                    batch_coarse_verb=batch_coarse_verb,
+                    batch_coarse_obj=batch_coarse_obj,
+                    pairs=batch_target
+                )
 
-                # Composition Loss
-                train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
-                pred_com_train = f[:, train_v_inds, train_o_inds]
-                loss_com = Loss_fn(pred_com_train * config.cosine_scale, batch_target)
-
-                # Component Loss (Important for maintaining component scores)
-                loss_verb = Loss_fn(p_v * config.cosine_scale, batch_verb)
-                loss_obj = Loss_fn(p_o * config.cosine_scale, batch_obj)
-
-                # Total Loss
-                loss = loss_com + 0.2 * (loss_verb + loss_obj)
-
+                # ---------------------------------------------------------
+                # 新版损失计算：直接进入我们重写好的 loss_calu
+                # ---------------------------------------------------------
+                loss = loss_calu(predict, target, config)
                 loss = loss / config.gradient_accumulation_steps
 
-            # Accumulates scaled gradients.
+            # 梯度回传与优化器更新
             scaler.scale(loss).backward()
 
-            # weights update
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
-                scaler.unscale_(optimizer)  # TODO:May be the reason for low acc on verb
-                # scaler.step(prompt_optimizer)
+                scaler.unscale_(optimizer) 
                 scaler.step(optimizer)
                 scaler.update()
-
-                # prompt_optimizer.zero_grad()
                 optimizer.zero_grad()
 
-            epoch_train_losses.append(loss.item())
+            epoch_train_losses.append(loss.item() * config.gradient_accumulation_steps)
 
-            # Record component losses for debugging
-            epoch_com_losses.append(loss_com.item())
-            epoch_vv_losses.append(loss_verb.item())
-            epoch_oo_losses.append(loss_obj.item())
+            # 占位记录，防止原版日志打印代码报错
+            epoch_com_losses.append(0.0)
+            epoch_vv_losses.append(0.0)
+            epoch_oo_losses.append(0.0)
 
             progress_bar.set_postfix({"train loss": np.mean(epoch_train_losses[-50:])})
             progress_bar.update()
 
-            # break
         lr_scheduler.step()
         progress_bar.close()
         progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}")
@@ -187,7 +187,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         log_training.write('\n')
         log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}\n")
 
-        # Additional logging for component losses
         log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses)}\n")
         log_training.write(f"epoch {i + 1} vv loss {np.mean(epoch_vv_losses)}\n")
         log_training.write(f"epoch {i + 1} oo loss {np.mean(epoch_oo_losses)}\n")
@@ -199,10 +198,8 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 'scheduler': lr_scheduler.state_dict(),
                 'scaler': scaler.state_dict(),
             }, config.save_path, i)
-        # if (i + 1) > config.val_epochs_ts:
-        #     torch.save(model.state_dict(), os.path.join(config.save_path, f"epoch_{i}.pt"))
-        key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm",
-                   "AUC"]
+            
+        key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
         if i % config.eval_every_n == 0 or i + 1 == config.epochs or i >= config.val_epochs_ts:
             print("Evaluating val dataset:")
             loss_avg, val_result = evaluate(model, val_dataset, config)
@@ -255,8 +252,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     log_training.write("Loss average on test dataset: {}\n".format(loss_avg))
         log_training.write('\n')
         log_training.flush()
-        key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm",
-                   "AUC"]
+        
         if i + 1 == config.epochs:
             print("Evaluating test dataset on Closed World")
             model.load_state_dict(torch.load(os.path.join(

@@ -419,11 +419,11 @@ def  predict_logits(model, dataset, config):
         ):
             batch_img = data[0].cuda()
             batch_target = data[3].cuda()
-            # if config.framework == 'vlm':
-
-            predict = model(batch_img, pairs.repeat(torch.cuda.device_count(), 1))  # TODO Using nagetive sample
-            # else:
-            #     predict = model(batch_img, pairs.repeat(torch.cuda.device_count(),1))
+            
+            # ------------ 第五步修改点：严格使用关键字传参 ------------
+            # 避免由于增加了粗粒度标签导致的 forward 位置参数错乱
+            predict = model(video=batch_img, pairs=pairs.repeat(torch.cuda.device_count(), 1)) 
+            # ---------------------------------------------------------
 
             logits = predict
             # print(logits.shape)

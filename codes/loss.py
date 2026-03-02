@@ -1,85 +1,54 @@
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
-import numpy as np
-import math  # 用于计算对数权重
+import math
 
-# 引入安全且对齐纯空间特征的底层算子
 from utils.lorentz import pairwise_dist, half_aperture, oxy_angle
 
-# ==============================================================================
-# 核心损失函数实现 (严格对齐 H^2EM)
-# ==============================================================================
+def dist_to_origin(x, c):
+    x_time = torch.sqrt(1.0 / c + torch.sum(x**2, dim=-1, keepdim=True))
+    return torch.acosh(torch.clamp(torch.sqrt(c) * x_time, min=1.0 + 1e-5)) / torch.sqrt(c)
 
 class HierarchicalEntailmentLoss(nn.Module):
-    """
-    层次蕴含损失 (Entailment Cone Loss)
-    严格对齐 H^2EM 公式 (11) 与 (12)
-    """
     def __init__(self, K=0.1):
         super().__init__()
         self.K = K
 
     def forward(self, child, parent, c):
-        # 1. 提取外角 theta (Eq. 12)
         theta = oxy_angle(parent, child, curv=c).unsqueeze(1)               
-        
-        # 2. 提取包含锥半角 omega(p)
         alpha_parent = half_aperture(parent, curv=c, min_radius=self.K).unsqueeze(1) 
-        
-        # 3. 严格对齐 Eq. 11: L_ent(p,q) = max(0, angle(p,q) - omega(p))
-        # 注: 已遵循 H^2EM 原始公式，去除了其他文献中常见的深度惩罚项
         loss_cone = F.relu(theta - alpha_parent)
-
         return loss_cone.mean()
-
 
 class DiscriminativeAlignmentLoss(nn.Module):
     """
-    判别对齐损失 (Discriminative Alignment Loss)
-    严格对齐 H^2EM 公式 (14) 及其附录的难负样本加权机制
+    基于 SupCon 的批次对齐损失。
+    完美解决 Batch 内存在相同标签导致模型崩溃(把正确的样本推开)的问题。
     """
     def __init__(self, temperature=0.07, hard_weight=3.0):
         super().__init__()
         self.temperature = temperature
         self.hard_weight = hard_weight
-        self.criterion = nn.CrossEntropyLoss()
 
-    def forward(self, v_hyp, t_hyp, c, batch_verb, batch_obj):
-        # 1. 使用内置 pairwise_dist 计算距离
+    def forward(self, v_hyp, t_hyp, c, mask_pos, mask_hard_neg):
         dist = pairwise_dist(v_hyp, t_hyp, curv=c)
         logits = -dist / self.temperature
         
-        B = v_hyp.size(0)
-        
-        # 2. 构建 H^2EM 定义的难负样本集 H_i (同动词或同物品)
-        mask_verb = (batch_verb.unsqueeze(1) == batch_verb.unsqueeze(0))
-        mask_obj = (batch_obj.unsqueeze(1) == batch_obj.unsqueeze(0))
-        # 难负样本：同动词或同物品，且必须排除对角线自身正样本
-        mask_hard = (mask_verb | mask_obj) & ~torch.eye(B, dtype=torch.bool, device=v_hyp.device)
-        
-        # 3. Eq. 14 分母权重对齐: 在 logits 上加 ln(w) 等价于在 softmax 中乘 w
         if self.hard_weight > 1.0:
-            penalty = math.log(self.hard_weight)
-            logits[mask_hard] += penalty
+            logits[mask_hard_neg] += math.log(self.hard_weight)
             
-        labels = torch.arange(B, device=v_hyp.device)
+        # 【核心修正】Supervised Contrastive 形式，完美包容同一 Batch 内的正样本
+        # 不再使用 torch.arange 让标签相同的互相排斥！
+        log_prob = F.log_softmax(logits, dim=1)
+        loss_v2t = - (log_prob * mask_pos.float()).sum(dim=1) / torch.clamp(mask_pos.float().sum(dim=1), min=1.0)
         
-        # 4. 双向 InfoNCE
-        loss_v2t = self.criterion(logits, labels)
-        loss_t2v = self.criterion(logits.t(), labels)
+        log_prob_t = F.log_softmax(logits.t(), dim=1)
+        loss_t2v = - (log_prob_t * mask_pos.float()).sum(dim=1) / torch.clamp(mask_pos.float().sum(dim=1), min=1.0)
         
-        return (loss_v2t + loss_t2v) / 2.0
+        return (loss_v2t.mean() + loss_t2v.mean()) / 2.0
 
-
-# ==============================================================================
-# 总损失函数计算路由
-# ==============================================================================
 
 def loss_calu(predict, target, config):
-    """
-    总损失入口
-    """
     batch_img, batch_verb, batch_obj, batch_pair, batch_coarse_verb, batch_coarse_obj = target
     batch_verb = batch_verb.cuda()
     batch_obj = batch_obj.cuda()
@@ -96,21 +65,31 @@ def loss_calu(predict, target, config):
     coarse_o_hyp = predict['coarse_o_hyp']    
 
     ce_loss_fn = nn.CrossEntropyLoss()
-    # 实例化 DAL，传入论文设定的难负样本权重 w=3.0
     dal_loss_fn = DiscriminativeAlignmentLoss(temperature=0.07, hard_weight=3.0)
-    # 实例化 HEM，常数 gamma (K) 为 0.1
     hem_loss_fn = HierarchicalEntailmentLoss(K=0.1)
 
-    # 1. 基础分类损失 (严格对齐 Eq. 15 Primitive Auxiliary Loss)
+    # 1. 基础分类损失 (不再是 9.5！)
     loss_cls_verb = ce_loss_fn(verb_logits, batch_verb)
     loss_cls_obj = ce_loss_fn(obj_logits, batch_obj)
     
-    # 2. 判别对齐损失 (包含难负样本逻辑)
-    loss_dal_verb = dal_loss_fn(v_hyp, t_v_hyp, c_pos, batch_verb, batch_obj)
-    loss_dal_obj = dal_loss_fn(o_hyp, t_o_hyp, c_pos, batch_verb, batch_obj)
+    # 2. 判别对齐损失 (彻底解除了梯度崩溃互搏)
+    # 计算 Batch 内动词和物品的正样本掩码
+    mask_verb = (batch_verb.unsqueeze(1) == batch_verb.unsqueeze(0))
+    mask_obj = (batch_obj.unsqueeze(1) == batch_obj.unsqueeze(0))
+    
+    # verb 的 DAL: 难负样本是 -> 动词不同，但物品相同！
+    mask_pos_verb = mask_verb
+    mask_hard_verb = mask_obj & (~mask_verb)
+    
+    # obj 的 DAL: 难负样本是 -> 物品不同，但动词相同！
+    mask_pos_obj = mask_obj
+    mask_hard_obj = mask_verb & (~mask_obj)
+
+    loss_dal_verb = dal_loss_fn(v_hyp, t_v_hyp, c_pos, mask_pos_verb, mask_hard_verb)
+    loss_dal_obj = dal_loss_fn(o_hyp, t_o_hyp, c_pos, mask_pos_obj, mask_hard_obj)
     loss_dal = loss_dal_verb + loss_dal_obj
 
-    # 3. 层次蕴含损失 (四大偏序链，依据用户之前确认的跨模态层次方案)
+    # 3. 层次蕴含损失
     loss_hem_v2fv = hem_loss_fn(child=v_hyp, parent=t_v_hyp, c=c_pos)
     loss_hem_fv2cv = hem_loss_fn(child=t_v_hyp, parent=coarse_v_hyp, c=c_pos)
     loss_hem_o2fo = hem_loss_fn(child=o_hyp, parent=t_o_hyp, c=c_pos)
@@ -118,10 +97,10 @@ def loss_calu(predict, target, config):
 
     loss_hem = loss_hem_v2fv + loss_hem_fv2cv + loss_hem_o2fo + loss_hem_fo2co
 
-    # 4. 总损失汇总 (严格对齐 Eq. 16: L_total = beta1 * L_DA + beta2 * L_TE + beta3 * L_cls)
-    w_cls = getattr(config, 'w_cls', 1.0)
+    # 4. 总损失汇总
+    w_cls = getattr(config, 'w_cls', 0.1)
     w_dal = getattr(config, 'w_dal', 1.0)
-    w_hem = getattr(config, 'w_hem', 1.0)
+    w_hem = getattr(config, 'w_hem', 0.5)
 
     total_loss = w_cls * (loss_cls_verb + loss_cls_obj) + \
                  w_dal * loss_dal + \
@@ -129,7 +108,7 @@ def loss_calu(predict, target, config):
 
     return total_loss
 
-# ----------------- 保留的外部接口 -----------------
+
 class KLLoss(nn.Module):
     def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
         super().__init__()

@@ -91,6 +91,12 @@ def loss_calu(predict, target, config):
     total_loss = w_cls * (loss_cls_verb + loss_cls_obj) + \
                  w_dal * loss_dal + \
                  w_hem * loss_hem
+    loss_dict = {
+        'loss_cls_verb': loss_cls_verb.item(),
+        'loss_cls_obj': loss_cls_obj.item(),
+        'loss_dal': loss_dal.item(),
+        'loss_hem': loss_hem.item()
+    }
 
     return total_loss
 

@@ -10,13 +10,6 @@ from utils.lorentz import exp_map0, pairwise_dist
 
 _tokenizer = _Tokenizer()
 
-# [核心抢救 1]：防 NaN 梯度断崖的绝对安全截断
-# 限制 min_norm=0.5 确保距离原点足够远，杜绝 arcsin 爆炸
-def safe_norm(x, min_norm=0.5, max_norm=10.0):
-    norm = torch.sqrt(torch.sum(x**2, dim=-1, keepdim=True) + 1e-8)
-    norm_clamped = torch.clamp(norm, min=min_norm, max=max_norm)
-    return x * (norm_clamped / norm)
-
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
         super(MLP, self).__init__()
@@ -142,9 +135,11 @@ class CustomCLIP(nn.Module):
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
         self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
-        self.visual_scale = nn.Parameter(torch.tensor([1.0]))
-        self.text_scale = nn.Parameter(torch.tensor([1.0]))
+        # 初始化缩放比例保持原始模长在一个安全的小空间内
+        self.visual_scale = nn.Parameter(torch.tensor([0.1]))
+        self.text_scale = nn.Parameter(torch.tensor([0.1]))
         
+        # 遵循 H2EM 的温度系数 0.07
         self.cls_temp = nn.Parameter(torch.tensor([0.07]))
 
     def forward(self, video, batch_verb=None, batch_obj=None, batch_coarse_verb=None, batch_coarse_obj=None, pairs=None):
@@ -173,32 +168,30 @@ class CustomCLIP(nn.Module):
 
         c_pos = F.softplus(self.c)
 
-        o_feat_norm = safe_norm(o_feat * self.visual_scale)
-        v_feat_norm = safe_norm(v_feat * self.visual_scale)
-        verb_text_norm = safe_norm(verb_text_features * self.text_scale)
-        obj_text_norm = safe_norm(obj_text_features * self.text_scale)
-        coarse_verb_norm = safe_norm(coarse_verb_features * self.text_scale)
-        coarse_obj_norm = safe_norm(coarse_obj_features * self.text_scale)
+        # 【核心修正】：强制退出 FP16，用纯粹无魔改的公式跑 FP32 双曲映射
+        with torch.cuda.amp.autocast(enabled=False):
+            c_fp32 = c_pos.float()
+            # 还原最干净的原味缩放
+            o_feat_fp32 = o_feat.float() * self.visual_scale.float()
+            v_feat_fp32 = v_feat.float() * self.visual_scale.float()
+            verb_text_fp32 = verb_text_features.float() * self.text_scale.float()
+            obj_text_fp32 = obj_text_features.float() * self.text_scale.float()
+            coarse_verb_fp32 = coarse_verb_features.float() * self.text_scale.float()
+            coarse_obj_fp32 = coarse_obj_features.float() * self.text_scale.float()
 
-        if self.training:
-            # [核心抢救 2]：微小抖动，杜绝视频和文本在双曲空间完全重合导致的 0/0 奇点
-            o_feat_norm = o_feat_norm + torch.randn_like(o_feat_norm) * 1e-4
-            v_feat_norm = v_feat_norm + torch.randn_like(v_feat_norm) * 1e-4
+            o_hyp = exp_map0(o_feat_fp32, curv=c_fp32)
+            v_hyp = exp_map0(v_feat_fp32, curv=c_fp32)
+            t_v_hyp_all = exp_map0(verb_text_fp32, curv=c_fp32)
+            t_o_hyp_all = exp_map0(obj_text_fp32, curv=c_fp32)
+            coarse_v_hyp_all = exp_map0(coarse_verb_fp32, curv=c_fp32)
+            coarse_o_hyp_all = exp_map0(coarse_obj_fp32, curv=c_fp32)
 
-        o_hyp = exp_map0(o_feat_norm, curv=c_pos)
-        v_hyp = exp_map0(v_feat_norm, curv=c_pos)
-        t_v_hyp_all = exp_map0(verb_text_norm, curv=c_pos)
-        t_o_hyp_all = exp_map0(obj_text_norm, curv=c_pos)
-        coarse_v_hyp_all = exp_map0(coarse_verb_norm, curv=c_pos)
-        coarse_o_hyp_all = exp_map0(coarse_obj_norm, curv=c_pos)
+            verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
+            obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
 
-        verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_pos)
-        obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_pos)
-
-        # 温度系数软约束，永不为负或零
-        temp = F.softplus(self.cls_temp) + 0.05
-        verb_logits = -verb_dist / temp
-        obj_logits = -obj_dist / temp
+            temp = torch.clamp(self.cls_temp.float(), min=0.01)
+            verb_logits = -verb_dist / temp
+            obj_logits = -obj_dist / temp
 
         if self.training:
             t_v_hyp_batch = t_v_hyp_all[batch_verb]
@@ -219,7 +212,7 @@ class CustomCLIP(nn.Module):
             }
             return predict
         else:
-            # 严格转为 0~1 的概率分数，完美适配你 test.py 里面 bias=0.001 的评测逻辑
+            # 推理阶段依据公式转回概率矩阵，适配你 test.py 里 +0.001 的校准基线逻辑
             verb_prob = torch.softmax(verb_logits, dim=-1)
             obj_prob = torch.softmax(obj_logits, dim=-1)
             pred_com = verb_prob.unsqueeze(2) * obj_prob.unsqueeze(1)

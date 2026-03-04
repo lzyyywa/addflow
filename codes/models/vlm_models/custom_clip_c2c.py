@@ -81,7 +81,7 @@ class TextEncoder(nn.Module):
         seq_len = x.shape[0]
         for block in self.transformer.resblocks:
             block.attn_mask = self.full_attn_mask[:seq_len, :seq_len]
-            
+
         x = self.transformer(x)
         x = x.permute(1, 0, 2)
         x = self.ln_final(x)
@@ -113,7 +113,7 @@ class CustomCLIP(nn.Module):
 
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
-        self.token_embedding = clip_model.token_embedding 
+        self.token_embedding = clip_model.token_embedding
 
         self.coarse_attrs = train_dataset.coarse_attrs
         self.coarse_objs = train_dataset.coarse_objs
@@ -121,6 +121,10 @@ class CustomCLIP(nn.Module):
         coarse_obj_prompts = [f"a video of a {c}" for c in self.coarse_objs]
         self.register_buffer('coarse_verb_tokens', clip.tokenize(coarse_verb_prompts))
         self.register_buffer('coarse_obj_tokens', clip.tokenize(coarse_obj_prompts))
+
+        # 【核心修正 1】：获取整个数据集的组合 prompt 模板，转成 tokens 缓存
+        comp_prompts = [f"a video of a person {v} {o}" for v, o in train_dataset.pairs]
+        self.register_buffer('comp_tokens', clip.tokenize(comp_prompts))
 
         try:
             fc_emb = cfg.fc_emb.split(',')
@@ -130,15 +134,19 @@ class CustomCLIP(nn.Module):
 
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
+        
+        # 【核心修正 2】：增加组合特征 (Composition) 的视觉投影 MLP
+        self.c2c_CE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
+        # 【核心修正 3】：增加组合特征 (Composition) 的文本投影 Linear
+        self.c2c_text_c = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
         self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
-        # 初始化缩放比例保持原始模长在一个安全的小空间内
         self.visual_scale = nn.Parameter(torch.tensor([0.1]))
         self.text_scale = nn.Parameter(torch.tensor([0.1]))
-        
+
         self.cls_temp = nn.Parameter(torch.tensor([0.07]))
 
     def forward(self, video, batch_verb=None, batch_obj=None, batch_coarse_verb=None, batch_coarse_obj=None, pairs=None):
@@ -153,10 +161,10 @@ class CustomCLIP(nn.Module):
         with torch.no_grad():
             c_v_emb = self.token_embedding(self.coarse_verb_tokens).type(self.text_encoder.dtype)
             c_o_emb = self.token_embedding(self.coarse_obj_tokens).type(self.text_encoder.dtype)
-            
+
         coarse_verb_features = self.text_encoder(c_v_emb, self.coarse_verb_tokens)
         coarse_obj_features = self.text_encoder(c_o_emb, self.coarse_obj_tokens)
-        
+
         coarse_verb_features = self.c2c_text_v(coarse_verb_features)
         coarse_obj_features = self.c2c_text_o(coarse_obj_features)
 
@@ -164,14 +172,18 @@ class CustomCLIP(nn.Module):
         o_feat = self.c2c_OE1(video_features.mean(dim=-1))
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
+        
+        # 【核心修正 4】：提取组合视觉特征 v_c
+        v_c_feat = self.c2c_CE1(video_features.mean(dim=-1))
 
         c_pos = F.softplus(self.c)
 
-        
         with torch.cuda.amp.autocast(enabled=False):
             c_fp32 = c_pos.float()
             o_feat_fp32 = o_feat.float() * self.visual_scale.float()
             v_feat_fp32 = v_feat.float() * self.visual_scale.float()
+            v_c_feat_fp32 = v_c_feat.float() * self.visual_scale.float()
+
             verb_text_fp32 = verb_text_features.float() * self.text_scale.float()
             obj_text_fp32 = obj_text_features.float() * self.text_scale.float()
             coarse_verb_fp32 = coarse_verb_features.float() * self.text_scale.float()
@@ -179,6 +191,8 @@ class CustomCLIP(nn.Module):
 
             o_hyp = exp_map0(o_feat_fp32, curv=c_fp32)
             v_hyp = exp_map0(v_feat_fp32, curv=c_fp32)
+            v_c_hyp = exp_map0(v_c_feat_fp32, curv=c_fp32) # 将组合视觉特征映射到双曲
+
             t_v_hyp_all = exp_map0(verb_text_fp32, curv=c_fp32)
             t_o_hyp_all = exp_map0(obj_text_fp32, curv=c_fp32)
             coarse_v_hyp_all = exp_map0(coarse_verb_fp32, curv=c_fp32)
@@ -192,6 +206,17 @@ class CustomCLIP(nn.Module):
             obj_logits = -obj_dist / temp
 
         if self.training:
+            # 【核心修正 5】：在训练阶段专门提取当前 Batch 对应的组合文本特征 t_c
+            batch_comp_tokens = self.comp_tokens[pairs]
+            with torch.no_grad():
+                batch_comp_emb = self.token_embedding(batch_comp_tokens).type(self.text_encoder.dtype)
+            batch_comp_text_features = self.text_encoder(batch_comp_emb, batch_comp_tokens)
+            batch_comp_text_features = self.c2c_text_c(batch_comp_text_features)
+            
+            with torch.cuda.amp.autocast(enabled=False):
+                t_c_feat_fp32 = batch_comp_text_features.float() * self.text_scale.float()
+                t_c_hyp_batch = exp_map0(t_c_feat_fp32, curv=c_fp32)
+
             t_v_hyp_batch = t_v_hyp_all[batch_verb]
             t_o_hyp_batch = t_o_hyp_all[batch_obj]
             coarse_v_hyp_batch = coarse_v_hyp_all[batch_coarse_verb]
@@ -203,8 +228,10 @@ class CustomCLIP(nn.Module):
                 'obj_logits': obj_logits,
                 'v_hyp': v_hyp,
                 'o_hyp': o_hyp,
+                'v_c_hyp': v_c_hyp,           # 传出 v_c，用于 HEM Loss
                 't_v_hyp': t_v_hyp_batch,
                 't_o_hyp': t_o_hyp_batch,
+                't_c_hyp': t_c_hyp_batch,     # 传出 t_c，用于 HEM Loss
                 'coarse_v_hyp': coarse_v_hyp_batch,
                 'coarse_o_hyp': coarse_o_hyp_batch
             }
@@ -213,7 +240,7 @@ class CustomCLIP(nn.Module):
             verb_prob = torch.softmax(verb_logits, dim=-1)
             obj_prob = torch.softmax(obj_logits, dim=-1)
             pred_com = verb_prob.unsqueeze(2) * obj_prob.unsqueeze(1)
-            
+
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
             com_logits = pred_com[:, verb_idx, obj_idx]
             return com_logits

@@ -172,9 +172,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             # ====== 新增：提取底层的曲率 c 和 温度 tau ======
             current_c = predict['c_pos'].item()
             if hasattr(model, 'module'): # 兼容多卡
-                current_temp = F.softplus(model.module.cls_temp).item() + 0.01
+                current_temp = F.softplus(model.module.cls_temp).item() + 0.05
             else:
-                current_temp = F.softplus(model.cls_temp).item() + 0.01
+                current_temp = F.softplus(model.cls_temp).item() + 0.05
 
             # ====== 修改：进度条实时显示所有关键指标（取最近50个batch的平滑平均值） ======
             progress_bar.set_postfix({

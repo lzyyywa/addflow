@@ -10,7 +10,7 @@ import torch.multiprocessing
 import numpy as np
 import json
 import math
-from torch.nn import CrossEntropyLoss  # 补充导入，防止 NameError
+from torch.nn import CrossEntropyLoss  
 from utils.ade_utils import emd_inference_opencv_test
 from collections import Counter
 from utils.hsic import hsic_normalized_cca
@@ -122,11 +122,11 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         )
 
         epoch_train_losses = []
-        # ====== 新增：更细致的损失监控列表 ======
         epoch_cls_v_losses = []
         epoch_cls_o_losses = []
         epoch_dal_losses = []
         epoch_hem_losses = []
+        epoch_com_losses = [] # 【新增】：监控 C2C 组合推断损失 L_com
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
@@ -150,7 +150,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     pairs=batch_target
                 )
 
-                # ====== 修改：接收 total_loss 和 loss_dict ======
                 loss, loss_dict = loss_calu(predict, target, config)
                 loss = loss / config.gradient_accumulation_steps
 
@@ -168,19 +167,19 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             epoch_cls_o_losses.append(loss_dict['loss_cls_obj'])
             epoch_dal_losses.append(loss_dict['loss_dal'])
             epoch_hem_losses.append(loss_dict['loss_hem'])
+            epoch_com_losses.append(loss_dict['loss_com']) # 【新增】：加入 L_com 列表
 
-            # ====== 新增：提取底层的曲率 c 和 温度 tau ======
             current_c = predict['c_pos'].item()
-            if hasattr(model, 'module'): # 兼容多卡
+            if hasattr(model, 'module'): 
                 current_temp = F.softplus(model.module.cls_temp).item() + 0.05
             else:
                 current_temp = F.softplus(model.cls_temp).item() + 0.05
 
-            # ====== 修改：进度条实时显示所有关键指标（取最近50个batch的平滑平均值） ======
             progress_bar.set_postfix({
                 "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
                 "v_cls": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
                 "o_cls": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
+                "com": f"{np.mean(epoch_com_losses[-50:]):.2f}", # 【新增】：进度条显示 L_com
                 "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
                 "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
                 "c": f"{current_c:.3f}", 
@@ -199,6 +198,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_verb loss {np.mean(epoch_cls_v_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_obj loss {np.mean(epoch_cls_o_losses):.4f}\n")
+        log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses):.4f}\n") # 【新增】：日志写入 L_com
         log_training.write(f"epoch {i + 1} dal loss {np.mean(epoch_dal_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} hem loss {np.mean(epoch_hem_losses):.4f}\n")
 

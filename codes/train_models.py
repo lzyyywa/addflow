@@ -113,6 +113,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
     train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
                                 for attr, obj in train_dataset.train_pairs]).cuda()
+    
+    # ================= 【新增这一行，其他地方完全没动】 =================
+    config.train_pairs = train_pairs
+    # ====================================================================
 
     train_losses = []
 

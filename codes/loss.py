@@ -48,16 +48,18 @@ class DiscriminativeAlignmentLoss(nn.Module):
 
 
 def loss_calu(predict, target, config):
-    batch_img, batch_verb, batch_obj, batch_pair, batch_coarse_verb, batch_coarse_obj = target
+    # 注意：这里解包出来的第4个参数是 batch_target (它在 train_pairs 中的索引标签)
+    batch_img, batch_verb, batch_obj, batch_target, batch_coarse_verb, batch_coarse_obj = target
     batch_verb = batch_verb.cuda()
     batch_obj = batch_obj.cuda()
+    batch_target = batch_target.cuda() # 确保送入 GPU，给交叉熵使用
     
     c_pos = predict['c_pos']
     verb_logits = predict['verb_logits']
     obj_logits = predict['obj_logits']
     
-    # 【新增】：提取 C2C 双流推断出的完整组合概率矩阵 [Batch, N_verb, N_obj]
-    pred_com_prob = predict['pred_com_prob'] 
+    # 【提取修改】：拿到未经过 softmax 污染的双曲联合 Logits
+    pred_com_logits = predict['pred_com_logits'] 
     
     v_hyp = predict['v_hyp']                  
     o_hyp = predict['o_hyp']
@@ -72,13 +74,16 @@ def loss_calu(predict, target, config):
     dal_loss_fn = DiscriminativeAlignmentLoss(temperature=0.07, hard_weight=3.0)
     hem_loss_fn = HierarchicalEntailmentLoss(K=0.1)
 
-    # ================= 1. C2C 核心推断损失 (新增) =================
-    B = pred_com_prob.size(0)
-    batch_idx = torch.arange(B, device=pred_com_prob.device)
-    # 取出当前 batch 中，真实的 verb 和 obj 对应的预测概率
-    target_probs = pred_com_prob[batch_idx, batch_verb, batch_obj]
-    # 使用负对数似然 (NLL) 逼近真实的组合
-    loss_com = -torch.log(target_probs + 1e-8).mean()
+    # ================= 1. C2C Vanilla 核心推断损失 (严格对齐原生) =================
+    train_pairs = config.train_pairs
+    train_v_inds = train_pairs[:, 0]
+    train_o_inds = train_pairs[:, 1]
+    
+    # 将 [B, N_verb, N_obj] 切片为 [B, Num_Seen_Pairs]
+    pred_com_train = pred_com_logits[:, train_v_inds, train_o_inds]
+    
+    # 直接用交叉熵，完美保住双曲梯度强度，对齐原生 Vanilla 逻辑！
+    loss_com = ce_loss_fn(pred_com_train, batch_target)
 
     # ================= 2. 基元分支交叉熵 (Primitive) =================
     loss_cls_verb = ce_loss_fn(verb_logits, batch_verb)
@@ -106,7 +111,7 @@ def loss_calu(predict, target, config):
 
     # ================= 5. 总损失融合 =================
     w_cls = getattr(config, 'w_cls', 1.0)
-    w_com = getattr(config, 'w_com', 1.0) # [新增] 获取组合损失权重
+    w_com = getattr(config, 'w_com', 1.0) 
     w_dal = getattr(config, 'w_dal', 1.0)
     w_hem = getattr(config, 'w_hem', 1.0)
 
@@ -118,7 +123,7 @@ def loss_calu(predict, target, config):
     loss_dict = {
         'loss_cls_verb': loss_cls_verb.item(),
         'loss_cls_obj': loss_cls_obj.item(),
-        'loss_com': loss_com.item(),      # [新增] 记录到字典供外层打印
+        'loss_com': loss_com.item(),      
         'loss_dal': loss_dal.item(),
         'loss_hem': loss_hem.item()
     }

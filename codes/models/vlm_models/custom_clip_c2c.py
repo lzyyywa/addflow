@@ -264,20 +264,20 @@ class CustomCLIP(nn.Module):
 
             temp = F.softplus(self.cls_temp) + 0.05
             
-            # --- 计算概率，严格复刻 C2C 公式！ ---
-            verb_prob = torch.softmax(-verb_dist / temp, dim=-1)   # p(v)
-            obj_prob = torch.softmax(-obj_dist / temp, dim=-1)     # p(o)
+            # ================= 【修改点 1：改为提取 Logits 并相加】 =================
+            verb_logits = -verb_dist / temp
+            obj_logits = -obj_dist / temp
+            cond_o_logits = -cond_o_dist / temp
+            cond_v_logits = -cond_v_dist / temp
             
-            p_o_con_v = torch.softmax(-cond_o_dist / temp, dim=-1) # p(o|v)
-            p_v_con_o = torch.softmax(-cond_v_dist / temp, dim=-1) # p(v|o)
+            # 动态路径 Logits: log p(v) + log p(o|v)
+            logits_dyn = cond_o_logits + verb_logits.unsqueeze(-1)  # [B, N_v, N_o]
+            # 静态路径 Logits: log p(o) + log p(v|o)
+            logits_sta = cond_v_logits.transpose(1, 2) + obj_logits.unsqueeze(1) # [B, N_v, N_o]
             
-            # 动态路径: p(o|v) * p(v)
-            p_pair_v = p_o_con_v * verb_prob.unsqueeze(-1)  # [B, N_v, N_o]
-            # 静态路径: p(v|o) * p(o)
-            p_pair_o = p_v_con_o.transpose(1, 2) * obj_prob.unsqueeze(1) # [B, N_v, N_o]
-            
-            # 双流联合，得到核心动作预测矩阵
-            pred_com_prob = (p_pair_v + p_pair_o) / 2.0
+            # 联合 Logits (等价于原生代码中未过 softmax 的 p_pair_v + p_pair_o)
+            pred_com_logits = logits_dyn + logits_sta
+            # ====================================================================
 
         if self.training:
             # 工具人 t_c 提取，专门用于 HEM Loss
@@ -298,9 +298,9 @@ class CustomCLIP(nn.Module):
 
             predict = {
                 'c_pos': c_pos,
-                'verb_logits': -verb_dist / temp,   # 给基元算 CrossEntropy
-                'obj_logits': -obj_dist / temp,     # 给基元算 CrossEntropy
-                'pred_com_prob': pred_com_prob,     # 【核心】：送给 Loss 计算 L_com
+                'verb_logits': verb_logits,        # [修改] 直接用上面算好的 logits
+                'obj_logits': obj_logits,          # [修改] 直接用上面算好的 logits
+                'pred_com_logits': pred_com_logits, # [修改] 传出联合 Logits 给 Loss
                 'v_hyp': v_hyp,
                 'o_hyp': o_hyp,
                 'v_c_hyp': v_c_hyp,                 # 工具人
@@ -312,9 +312,9 @@ class CustomCLIP(nn.Module):
             }
             return predict
         else:
-            # 【完美闭环】：推断直接用 C2C 双流概率矩阵，彻底无视 v_c
+            # 测试阶段直接返回切片后的联合 Logits
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-            com_logits = pred_com_prob[:, verb_idx, obj_idx]
+            com_logits = pred_com_logits[:, verb_idx, obj_idx]
             return com_logits
 
 def load_clip_to_cpu(cfg):

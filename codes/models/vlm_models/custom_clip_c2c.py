@@ -208,26 +208,25 @@ class CustomCLIP(nn.Module):
             n_v = verb_text_fp32.shape[0]
             n_o = obj_text_fp32.shape[0]
 
+            # ===================== 一键分支切换：双曲 vs 欧式 =====================
             if self.use_hyperbolic:
-                # ------------------------- 终极双曲分支 -------------------------
+                # ------------------------- 【最纯正双曲分支 (零归一化 + HP投影)】 -------------------------
+                # 仅仅限制 scale 的下限防止除零，不干涉特征原生的方向和模长
                 v_scale = torch.clamp(self.visual_scale.float(), min=0.1)
                 t_scale = torch.clamp(self.text_scale.float(), min=0.1)
 
-                # 【核心修复1：H2EM层级深度强制约束】
-                # 利用归一化和阶梯倍数，强制架构保证：粗粒度距离 < 细粒度距离 < 组合距离
-                # 这杜绝了特征乱跑导致的 HEM 梯度塌陷
-                d_coarse, d_fine, d_comp = 1.0, 2.0, 3.0 
+                # 【核心修正】：彻底抛弃 F.normalize，原汁原味地保留欧式 MLP 输出的模长！
+                # 模长(Norm) = 语义深度。让 HEM Loss 去教模型拉长组合特征、缩短粗粒度特征。
+                o_feat_scaled = o_feat_fp32 * v_scale
+                v_feat_scaled = v_feat_fp32 * v_scale
+                v_c_feat_scaled = v_c_feat_fp32 * v_scale
 
-                o_feat_scaled = F.normalize(o_feat_fp32, dim=-1) * (v_scale * d_fine)
-                v_feat_scaled = F.normalize(v_feat_fp32, dim=-1) * (v_scale * d_fine)
-                v_c_feat_scaled = F.normalize(v_c_feat_fp32, dim=-1) * (v_scale * d_comp)
+                verb_text_scaled = verb_text_fp32 * t_scale
+                obj_text_scaled = obj_text_fp32 * t_scale
+                coarse_verb_scaled = coarse_verb_features.float() * t_scale
+                coarse_obj_scaled = coarse_obj_features.float() * t_scale
 
-                verb_text_scaled = F.normalize(verb_text_fp32, dim=-1) * (t_scale * d_fine)
-                obj_text_scaled = F.normalize(obj_text_fp32, dim=-1) * (t_scale * d_fine)
-                coarse_verb_scaled = F.normalize(coarse_verb_features.float(), dim=-1) * (t_scale * d_coarse)
-                coarse_obj_scaled = F.normalize(coarse_obj_features.float(), dim=-1) * (t_scale * d_coarse)
-
-                # 映射基础概念进入双曲空间建立树结构
+                # 1. 映射基础概念进入双曲空间，建立树结构
                 o_hyp = exp_map0(o_feat_scaled, curv=c_fp32)
                 v_hyp = exp_map0(v_feat_scaled, curv=c_fp32)
                 v_c_hyp = exp_map0(v_c_feat_scaled, curv=c_fp32) 
@@ -237,23 +236,20 @@ class CustomCLIP(nn.Module):
                 coarse_v_hyp_all = exp_map0(coarse_verb_scaled, curv=c_fp32)
                 coarse_o_hyp_all = exp_map0(coarse_obj_scaled, curv=c_fp32)
 
-                # 【核心修复2：HyperExpress 平坦原生组合】
-                # 抛弃数值不稳定的 exp -> log反复横跳，直接用欧式原生特征完成拼接融合
-                cond_v_flat_in = F.normalize(v_feat_c.float(), dim=-1) * (v_scale * d_fine)
-                cond_o_flat_in = F.normalize(o_feat_c.float(), dim=-1) * (v_scale * d_fine)
+                # 2. 在平坦切空间中完成特征融合 (HyperExpress HP核心思想)
+                # 使用的也是纯净的 scaled 特征，绝不归一化
+                cond_v_flat_in = v_feat_c.float() * v_scale
+                cond_o_flat_in = o_feat_c.float() * v_scale
 
                 cond_v_flat_out, cond_o_flat_out = self.condition_module_hyperbolic(
                     cond_v_flat_in, cond_o_flat_in, verb_text_scaled, obj_text_scaled, n_o, b, feat_dim_c, n_v
                 )
 
-                # 赋予组合特征 第3层级(d_comp) 的合法深度，再进入双曲空间
-                cond_o_flat_out = F.normalize(cond_o_flat_out, dim=-1) * (v_scale * d_comp)
-                cond_v_flat_out = F.normalize(cond_v_flat_out, dim=-1) * (v_scale * d_comp)
-
+                # 融合后直接升维进入双曲空间
                 cond_o_hyp = exp_map0(cond_o_flat_out, curv=c_fp32) # [B, N_v, D]
                 cond_v_hyp = exp_map0(cond_v_flat_out, curv=c_fp32) # [B, N_o, D]
 
-                # --- 测地距离计算 ---
+                # --- 测地距离计算 (与之前相同) ---
                 verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
                 obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
                 cond_o_dist = pairwise_dist(cond_o_hyp.view(-1, feat_dim_c), t_o_hyp_all, curv=c_fp32).view(b, n_v, n_o)
@@ -269,8 +265,7 @@ class CustomCLIP(nn.Module):
                 logits_dyn = cond_o_logits + verb_logits.unsqueeze(-1)  
                 logits_sta = cond_v_logits.transpose(1, 2) + obj_logits.unsqueeze(1) 
 
-                # 【核心修复3：C2C Vanilla 双流融合概率对齐】
-                # 利用 LogSumExp 在对数空间完成概率严格相加 (P_dyn + P_sta)，解决之前的"逻辑乘法"漏洞
+                # C2C Vanilla 双流融合概率对齐
                 pred_com_logits = torch.logsumexp(torch.stack([logits_dyn, logits_sta], dim=0), dim=0)
 
                 if self.training:
@@ -281,7 +276,8 @@ class CustomCLIP(nn.Module):
                     batch_comp_text_features = self.c2c_text_c(batch_comp_text_features)
 
                     with torch.cuda.amp.autocast(enabled=False):
-                        t_c_feat_fp32 = F.normalize(batch_comp_text_features.float(), dim=-1) * (t_scale * d_comp)
+                        # 工具人 t_c 也保持纯净
+                        t_c_feat_fp32 = batch_comp_text_features.float() * t_scale
                         t_c_hyp_batch = exp_map0(t_c_feat_fp32, curv=c_fp32)
 
                     t_v_hyp_batch = t_v_hyp_all[batch_verb]

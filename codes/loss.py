@@ -1,4 +1,4 @@
-(c2c) root@interactive10085:~/C2C/38addcom-main/codes# cat loss.py
+
 import torch.nn.functional as F
 import torch.nn as nn
 import torch

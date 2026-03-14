@@ -75,6 +75,7 @@ train:
   w_com: 1.0
   w_dal: 1.0   #判别对齐损失权重
   w_hem: 0.5   #层次蕴含  
+  use_hyperbolic: True
 
 test:
   eval_batch_size: 32

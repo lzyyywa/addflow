@@ -10,7 +10,7 @@ import torch.multiprocessing
 import numpy as np
 import json
 import math
-from torch.nn import CrossEntropyLoss
+from torch.nn import CrossEntropyLoss  
 from utils.ade_utils import emd_inference_opencv_test
 from collections import Counter
 from utils.hsic import hsic_normalized_cca
@@ -142,18 +142,60 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             target = [batch_img, batch_verb, batch_obj, batch_target, batch_coarse_verb, batch_coarse_obj]
 
-            with torch.cuda.amp.autocast(enabled=True):
-                predict = model(
-                    video=batch_img,
-                    batch_verb=batch_verb,
-                    batch_obj=batch_obj,
-                    batch_coarse_verb=batch_coarse_verb,
-                    batch_coarse_obj=batch_coarse_obj,
-                    pairs=batch_target
-                )
+            # ===================== 一键分支切换：双曲 vs 欧式 =====================
+            use_hyperbolic = getattr(config, 'use_hyperbolic', True)
 
-                loss, loss_dict = loss_calu(predict, target, config)
-                loss = loss / config.gradient_accumulation_steps
+            with torch.cuda.amp.autocast(enabled=True):
+                if use_hyperbolic:
+                    # 双曲分支：传入所有参数，需要你的 custom_clip_c2c.py 是最新版本
+                    predict = model(
+                        video=batch_img,
+                        batch_verb=batch_verb,
+                        batch_obj=batch_obj,
+                        batch_coarse_verb=batch_coarse_verb,
+                        batch_coarse_obj=batch_coarse_obj,
+                        pairs=batch_target
+                    )
+                    loss, loss_dict = loss_calu(predict, target, config)
+                else:
+                    # 欧式分支：只传 video 和 pairs！完美兼容你未修改的任何原生模型，绝不报错
+                    predict = model(video=batch_img, pairs=batch_target)
+                    
+                    ce_loss_fn = CrossEntropyLoss()
+                    cosine_scale = getattr(config, 'cosine_scale', 4.5) 
+                    
+                    # 智能解析模型输出（兼容字典输出和元组输出）
+                    if isinstance(predict, dict):
+                        verb_logits = predict['verb_logits']
+                        obj_logits = predict['obj_logits']
+                        pred_com_prob = predict['pred_com_prob']
+                    else:
+                        # 兼容你最原生的 C2C 模型结构
+                        verb_logits, obj_logits, p_pair_v, p_pair_o = predict[0], predict[1], predict[2], predict[3]
+                        pred_com_prob = p_pair_v + p_pair_o
+                        
+                    loss_cls_verb = ce_loss_fn(verb_logits * cosine_scale, batch_verb)
+                    loss_cls_obj = ce_loss_fn(obj_logits * cosine_scale, batch_obj)
+                    
+                    train_v_inds = config.train_pairs[:, 0]
+                    train_o_inds = config.train_pairs[:, 1]
+                    pred_com_train = pred_com_prob[:, train_v_inds, train_o_inds]
+                    
+                    loss_com = ce_loss_fn(pred_com_train * cosine_scale, batch_target)
+                    
+                    # 【核心定制】：欧式总损失 = loss_com + 0.2 * loss_cls_verb + 0.2 * loss_cls_obj
+                    loss = loss_com + 0.2 * loss_cls_verb + 0.2 * loss_cls_obj
+                    
+                    loss_dict = {
+                        'loss_cls_verb': loss_cls_verb.item(),
+                        'loss_cls_obj': loss_cls_obj.item(),
+                        'loss_com': loss_com.item(),
+                        'loss_dal': 0.0, 
+                        'loss_hem': 0.0  
+                    }
+            # ====================================================================
+
+            loss = loss / config.gradient_accumulation_steps
 
             scaler.scale(loss).backward()
 
@@ -163,25 +205,29 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 scaler.update()
                 optimizer.zero_grad()
 
-            # 记录总损失和各个子损失
             epoch_train_losses.append(loss.item() * config.gradient_accumulation_steps)
             epoch_cls_v_losses.append(loss_dict['loss_cls_verb'])
             epoch_cls_o_losses.append(loss_dict['loss_cls_obj'])
             epoch_dal_losses.append(loss_dict['loss_dal'])
             epoch_hem_losses.append(loss_dict['loss_hem'])
-            epoch_com_losses.append(loss_dict['loss_com']) 
+            epoch_com_losses.append(loss_dict['loss_com'])
 
-            current_c = predict['c_pos'].item()
-            if hasattr(model, 'module'):
-                current_temp = F.softplus(model.module.cls_temp).item() + 0.05
+            # 安全提取曲率 c 和温度 tau (兼容纯原生模型)
+            if use_hyperbolic and isinstance(predict, dict):
+                current_c = predict['c_pos'].item()
             else:
-                current_temp = F.softplus(model.cls_temp).item() + 0.05
+                current_c = 0.0
+
+            if hasattr(model, 'module'):
+                current_temp = F.softplus(model.module.cls_temp).item() + 0.05 if hasattr(model.module, 'cls_temp') else 0.0
+            else:
+                current_temp = F.softplus(model.cls_temp).item() + 0.05 if hasattr(model, 'cls_temp') else 0.0
 
             progress_bar.set_postfix({
                 "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
                 "v_cls": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
                 "o_cls": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
-                "com": f"{np.mean(epoch_com_losses[-50:]):.2f}", 
+                "com": f"{np.mean(epoch_com_losses[-50:]):.2f}",
                 "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
                 "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
                 "c": f"{current_c:.3f}",
@@ -192,7 +238,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         lr_scheduler.step()
         progress_bar.close()
 
-        # 打印并写入到 log.txt
         progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}")
         train_losses.append(np.mean(epoch_train_losses))
 
@@ -200,7 +245,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_verb loss {np.mean(epoch_cls_v_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_obj loss {np.mean(epoch_cls_o_losses):.4f}\n")
-        log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses):.4f}\n") # 【新增】：日志写入 L_com
+        log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} dal loss {np.mean(epoch_dal_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} hem loss {np.mean(epoch_hem_losses):.4f}\n")
 

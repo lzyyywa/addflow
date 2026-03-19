@@ -129,6 +129,11 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         epoch_dal_losses = []
         epoch_hem_losses = []
         epoch_com_losses = [] 
+        # ==========================================
+        # 【新增】：监控 Flow 和 Leak 损失的列表
+        # ==========================================
+        epoch_flow_losses = []
+        epoch_leak_losses = []
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
@@ -147,7 +152,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             with torch.cuda.amp.autocast(enabled=True):
                 if use_hyperbolic:
-                    # 双曲分支：传入所有参数，需要你的 custom_clip_c2c.py 是最新版本
+                    # 双曲分支：传入所有参数
                     predict = model(
                         video=batch_img,
                         batch_verb=batch_verb,
@@ -158,19 +163,18 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     )
                     loss, loss_dict = loss_calu(predict, target, config)
                 else:
-                    # 欧式分支：只传 video 和 pairs！完美兼容你未修改的任何原生模型，绝不报错
+                    # 欧式分支：完美兼容原生 C2C
                     predict = model(video=batch_img, pairs=batch_target)
                     
                     ce_loss_fn = CrossEntropyLoss()
                     cosine_scale = getattr(config, 'cosine_scale', 4.5) 
                     
-                    # 智能解析模型输出（兼容字典输出和元组输出）
+                    # 智能解析模型输出
                     if isinstance(predict, dict):
                         verb_logits = predict['verb_logits']
                         obj_logits = predict['obj_logits']
                         pred_com_prob = predict['pred_com_prob']
                     else:
-                        # 兼容你最原生的 C2C 模型结构
                         verb_logits, obj_logits, p_pair_v, p_pair_o = predict[0], predict[1], predict[2], predict[3]
                         pred_com_prob = p_pair_v + p_pair_o
                         
@@ -183,7 +187,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     
                     loss_com = ce_loss_fn(pred_com_train * cosine_scale, batch_target)
                     
-                    # 【核心定制】：欧式总损失 = loss_com + 0.2 * loss_cls_verb + 0.2 * loss_cls_obj
                     loss = loss_com + 0.2 * loss_cls_verb + 0.2 * loss_cls_obj
                     
                     loss_dict = {
@@ -191,9 +194,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                         'loss_cls_obj': loss_cls_obj.item(),
                         'loss_com': loss_com.item(),
                         'loss_dal': 0.0, 
-                        'loss_hem': 0.0  
+                        'loss_hem': 0.0,
+                        'loss_flow': 0.0,  # 【新增】：占位符兼容欧氏分支
+                        'loss_leak': 0.0   # 【新增】：占位符兼容欧氏分支
                     }
-            # ====================================================================
 
             loss = loss / config.gradient_accumulation_steps
 
@@ -206,15 +210,21 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 optimizer.zero_grad()
 
             epoch_train_losses.append(loss.item() * config.gradient_accumulation_steps)
-            epoch_cls_v_losses.append(loss_dict['loss_cls_verb'])
-            epoch_cls_o_losses.append(loss_dict['loss_cls_obj'])
-            epoch_dal_losses.append(loss_dict['loss_dal'])
-            epoch_hem_losses.append(loss_dict['loss_hem'])
-            epoch_com_losses.append(loss_dict['loss_com'])
+            epoch_cls_v_losses.append(loss_dict.get('loss_cls_verb', 0.0))
+            epoch_cls_o_losses.append(loss_dict.get('loss_cls_obj', 0.0))
+            epoch_dal_losses.append(loss_dict.get('loss_dal', 0.0))
+            epoch_hem_losses.append(loss_dict.get('loss_hem', 0.0))
+            epoch_com_losses.append(loss_dict.get('loss_com', 0.0))
+            
+            # ==========================================
+            # 【新增】：安全提取 Flow 和 Leak 的值
+            # ==========================================
+            epoch_flow_losses.append(loss_dict.get('loss_flow', 0.0))
+            epoch_leak_losses.append(loss_dict.get('loss_leak', 0.0))
 
-            # 安全提取曲率 c 和温度 tau (兼容纯原生模型)
+            # 安全提取曲率 c 和温度 tau
             if use_hyperbolic and isinstance(predict, dict):
-                current_c = predict['c_pos'].item()
+                current_c = predict.get('c_pos', torch.tensor(0.0)).item()
             else:
                 current_c = 0.0
 
@@ -223,6 +233,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             else:
                 current_temp = F.softplus(model.cls_temp).item() + 0.05 if hasattr(model, 'cls_temp') else 0.0
 
+            # ==========================================
+            # 【新增】：在终端进度条显示 flow 和 leak
+            # ==========================================
             progress_bar.set_postfix({
                 "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
                 "v_cls": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
@@ -230,6 +243,8 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 "com": f"{np.mean(epoch_com_losses[-50:]):.2f}",
                 "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
                 "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
+                "flow": f"{np.mean(epoch_flow_losses[-50:]):.2f}", # <--- 让你实时看到流匹配收敛！
+                "leak": f"{np.mean(epoch_leak_losses[-50:]):.2f}", # <--- 让你实时看到泄漏惩罚生效！
                 "c": f"{current_c:.3f}",
                 "tau": f"{current_temp:.3f}"
             })
@@ -248,6 +263,11 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} dal loss {np.mean(epoch_dal_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} hem loss {np.mean(epoch_hem_losses):.4f}\n")
+        # ==========================================
+        # 【新增】：将这两个 Loss 写入本地日志，方便以后画曲线
+        # ==========================================
+        log_training.write(f"epoch {i + 1} flow loss {np.mean(epoch_flow_losses):.4f}\n")
+        log_training.write(f"epoch {i + 1} leak loss {np.mean(epoch_leak_losses):.4f}\n")
 
         if (i + 1) % config.save_every_n == 0:
             save_checkpoint({
@@ -257,6 +277,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 'scaler': scaler.state_dict(),
             }, config.save_path, i)
 
+        # ====== 下方的评估验证代码完全不用修改，保持你的原生逻辑 ======
         key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
         if i % config.eval_every_n == 0 or i + 1 == config.epochs or i >= config.val_epochs_ts:
             print("Evaluating val dataset:")

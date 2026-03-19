@@ -181,7 +181,7 @@ class CustomCLIP(nn.Module):
         )
         # =====================================================================
 
-        self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=True)
+        self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
         self.visual_scale = nn.Parameter(torch.tensor([1.0]))
         self.text_scale = nn.Parameter(torch.tensor([1.0]))
         
@@ -235,7 +235,7 @@ class CustomCLIP(nn.Module):
         o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
         v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
 
-        c_pos = torch.clamp(F.softplus(self.c), min=0.5)
+        c_pos = self.c
 
         with torch.cuda.amp.autocast(enabled=False):
             c_fp32 = c_pos.float()
@@ -456,7 +456,7 @@ def build_model(train_dataset, cfg):
         elif 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
-        elif 'c2c' in name or name in ['visual_scale', 'text_scale', 'cls_temp', 'c', 'd_coarse', 'd_fine', 'd_comp']:
+        elif 'c2c' in name or name in ['visual_scale', 'text_scale', 'cls_temp', 'd_coarse', 'd_fine', 'd_comp']:
             param.requires_grad = True
         # 释放我们新增的两个 Flow 专用的权重用于反向传播！
         elif 'flow_pred' in name or 'composer' in name:

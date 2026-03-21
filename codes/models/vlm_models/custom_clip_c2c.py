@@ -148,7 +148,7 @@ class CustomCLIP(nn.Module):
         self.c2c_VE2 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
         # -------------------------------------------------------------
-        # 保留 Vanilla C2C 黑盒交叉组合模块 (当 use_hyperbolic=False 时启用)
+        # 保留 Vanilla C2C 黑盒交叉组合模块
         # -------------------------------------------------------------
         self.c2c_f_v_e_o_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
         self.c2c_f_o_e_v_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
@@ -158,34 +158,29 @@ class CustomCLIP(nn.Module):
         self.c2c_text_c = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
         # =====================================================================
-        # 【新增：FlowComposer 专用核心网络】(当 use_hyperbolic=True 时启用)
+        # 【新增：FlowComposer 专用核心网络】
         # =====================================================================
-        # 1. 速度预测器 (Velocity Predictors) -> 负责欧氏空间内的 Flow Matching 对齐
         self.flow_pred_v = MLP(int(cfg.emb_dim), int(cfg.emb_dim), relu=cfg.relu, num_layers=2, dropout=False, norm=True)
         self.flow_pred_o = MLP(int(cfg.emb_dim), int(cfg.emb_dim), relu=cfg.relu, num_layers=2, dropout=False, norm=True)
 
-        # 2. 显式流组合器 (Explicit Flow Composers) -> 负责输出 alpha, beta 显式权重
-        # 动态路径: 动词主导 (Verb Vis + Obj Text)
         self.composer_dyn = nn.Sequential(
             nn.Linear(2 * int(cfg.emb_dim), int(cfg.emb_dim)),
             nn.ReLU(inplace=True),
             nn.Linear(int(cfg.emb_dim), 2),
-            nn.Sigmoid() # 将组合权重限制在 (0, 1) 区间
+            nn.Sigmoid() 
         )
-        # 静态路径: 物体主导 (Obj Vis + Verb Text)
         self.composer_sta = nn.Sequential(
             nn.Linear(2 * int(cfg.emb_dim), int(cfg.emb_dim)),
             nn.ReLU(inplace=True),
             nn.Linear(int(cfg.emb_dim), 2),
             nn.Sigmoid()
         )
-        # =====================================================================
 
-        self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+        # 【重大修复】：重新打开曲率自适应学习，解放双曲空间！
+        self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=True)
         self.visual_scale = nn.Parameter(torch.tensor([1.0]))
         self.text_scale = nn.Parameter(torch.tensor([1.0]))
         
-        # 核心层级深度参数（初始化分别对应 粗、细、组合）
         self.d_coarse = nn.Parameter(torch.tensor([1.0]))
         self.d_fine = nn.Parameter(torch.tensor([2.0]))
         self.d_comp = nn.Parameter(torch.tensor([3.0]))
@@ -235,7 +230,8 @@ class CustomCLIP(nn.Module):
         o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
         v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
 
-        c_pos = self.c
+        # 【重大修复】：恢复 Softplus，允许模型自适应降曲率！
+        c_pos = torch.clamp(F.softplus(self.c), min=0.5)
 
         with torch.cuda.amp.autocast(enabled=False):
             c_fp32 = c_pos.float()
@@ -253,24 +249,19 @@ class CustomCLIP(nn.Module):
             n_o = obj_text_fp32.shape[0]
 
             if self.use_hyperbolic:
-                # ====================================================================
-                # 【Flow-Hyperbolic 究极进化】 严格执行六步单向映射方案
-                # ====================================================================
                 v_scale = torch.clamp(self.visual_scale.float(), min=0.01)
                 t_scale = torch.clamp(self.text_scale.float(), min=0.01)
                 d_c = F.softplus(self.d_coarse)
                 d_f = F.softplus(self.d_fine)
                 d_m = F.softplus(self.d_comp)
-                MAX_R = 5.0 # 防爆阈值
+                MAX_R = 5.0
 
                 # -------------------------------------------------------------------
                 # 第一步 & 第二步：欧氏平坦空间基础特征提取与流匹配 (Flow Matching)
                 # -------------------------------------------------------------------
-                # 预测流速 (Velocity)
                 pred_v_flow = self.flow_pred_v(v_feat_fp32)
                 pred_o_flow = self.flow_pred_o(o_feat_fp32)
 
-                # 生成用于流匹配监督的目标轨迹 (Target Velocity)
                 flow_target_v, flow_target_o = None, None
                 if self.training and batch_verb is not None:
                     gt_v_text = verb_text_fp32[batch_verb]
@@ -278,49 +269,49 @@ class CustomCLIP(nn.Module):
                     flow_target_v = gt_v_text - v_feat_fp32
                     flow_target_o = gt_o_text - o_feat_fp32
 
-                # 欧拉一步传输 (One-Step Transport)：让视觉在欧氏空间流向文本
                 v_aligned = v_feat_fp32 + pred_v_flow
                 o_aligned = o_feat_fp32 + pred_o_flow
 
                 # -------------------------------------------------------------------
-                # 第三步：显式流组合生成 (Explicit Flow Composition)
+                # 第三步：【残差流组合生成】 (Residual Flow Composition) - 解决视频拟合痛点
                 # -------------------------------------------------------------------
-                # 预处理交叉拼接维度，保留原生 C2C 双路设计思想，但升级为线性可解释加法
                 v_feat_c_exp = v_feat_c.float().unsqueeze(1).repeat(1, n_o, 1).view(-1, feat_dim_c)
                 o_text_exp = obj_text_fp32.unsqueeze(0).repeat(b, 1, 1).view(-1, feat_dim_c)
                 
                 o_feat_c_exp = o_feat_c.float().unsqueeze(1).repeat(1, n_v, 1).view(-1, feat_dim_c)
                 v_text_exp = verb_text_fp32.unsqueeze(0).repeat(b, 1, 1).view(-1, feat_dim_c)
 
-                # 动态路径 (动词视觉主导)
+                # 1. 计算原生的非线性交叉 MLP (极其关键，弥补纯线性在复杂视频上的不足)
+                cond_v_euc_base, cond_o_euc_base = self.condition_module_hyperbolic(
+                    v_feat_c.float(), o_feat_c.float(), verb_text_fp32, obj_text_fp32, n_o, b, feat_dim_c, n_v
+                )
+
+                # 2. 计算显式 Flow 动态权重
                 gates_dyn = self.composer_dyn(torch.cat([v_feat_c_exp, o_text_exp], dim=-1))
                 alpha_dyn, beta_dyn = gates_dyn[:, 0:1], gates_dyn[:, 1:2]
-                cond_v_flow = (alpha_dyn * v_feat_c_exp + beta_dyn * o_text_exp).view(b, n_o, -1)
 
-                # 静态路径 (物体视觉主导)
                 gates_sta = self.composer_sta(torch.cat([o_feat_c_exp, v_text_exp], dim=-1))
                 alpha_sta, beta_sta = gates_sta[:, 0:1], gates_sta[:, 1:2]
-                cond_o_flow = (alpha_sta * o_feat_c_exp + beta_sta * v_text_exp).view(b, n_v, -1)
+
+                # 3. 线性物理叠加 + MLP 非线性残差 = 王者组合
+                cond_v_flow = (alpha_dyn * v_feat_c_exp + beta_dyn * o_text_exp).view(b, n_o, -1) + cond_v_euc_base
+                cond_o_flow = (alpha_sta * o_feat_c_exp + beta_sta * v_text_exp).view(b, n_v, -1) + cond_o_euc_base
 
                 # -------------------------------------------------------------------
                 # 第四步：单向深度注入与双曲映射 (Hyperbolic Embedding)
                 # -------------------------------------------------------------------
-                # 赋予基元特征深度 d_f
                 o_feat_clipped = clip_by_norm(o_aligned * v_scale * d_f, MAX_R)
                 v_feat_clipped = clip_by_norm(v_aligned * v_scale * d_f, MAX_R)
                 v_c_feat_clipped = clip_by_norm(v_c_feat_fp32 * v_scale * d_m, MAX_R)
                 
-                # 赋予组合特征最深层级 d_m
                 cond_o_clipped = clip_by_norm(cond_o_flow * v_scale * d_m, MAX_R)
                 cond_v_clipped = clip_by_norm(cond_v_flow * v_scale * d_m, MAX_R)
 
-                # 文本特征也赋予对应的深度
                 t_v_clipped = clip_by_norm(verb_text_fp32 * t_scale * d_f, MAX_R)
                 t_o_clipped = clip_by_norm(obj_text_fp32 * t_scale * d_f, MAX_R)
                 coarse_v_clipped = clip_by_norm(coarse_verb_features.float() * t_scale * d_c, MAX_R)
                 coarse_o_clipped = clip_by_norm(coarse_obj_features.float() * t_scale * d_c, MAX_R)
 
-                # 统一且单向地使用 exp_map0 打入双曲空间，彻底消除折返映射形变！
                 o_hyp = exp_map0(o_feat_clipped, curv=c_fp32)
                 v_hyp = exp_map0(v_feat_clipped, curv=c_fp32)
                 v_c_hyp = exp_map0(v_c_feat_clipped, curv=c_fp32) 
@@ -334,9 +325,8 @@ class CustomCLIP(nn.Module):
                 cond_v_hyp = exp_map0(cond_v_clipped, curv=c_fp32)
 
                 # -------------------------------------------------------------------
-                # 第五步：双曲空间判别与泄漏增强约束 (Hyperbolic Constraints & Leakage)
+                # 第五步：双曲空间判别与泄漏增强约束 (Hyperbolic Constraints)
                 # -------------------------------------------------------------------
-                # 计算纯正的双曲测地距离
                 verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
                 obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
                 cond_o_dist = pairwise_dist(cond_o_hyp.view(-1, feat_dim_c), t_o_hyp_all, curv=c_fp32).view(b, n_v, n_o)
@@ -348,19 +338,18 @@ class CustomCLIP(nn.Module):
                 cond_o_logits = -cond_o_dist / temp
                 cond_v_logits = -cond_v_dist / temp
 
-                # 【变废为宝】：利用固有纠缠，计算泄漏预测的 Logits
+                # 哪怕 YAML 配置权重为 0，前向依然计算并传出，保证代码不崩溃
                 leak_v_dist = pairwise_dist(o_hyp, t_v_hyp_all, curv=c_fp32)
                 leak_o_dist = pairwise_dist(v_hyp, t_o_hyp_all, curv=c_fp32)
                 leak_v_logits = -leak_v_dist / temp
                 leak_o_logits = -leak_o_dist / temp
 
-                # 基于原生 C2C 加法规则的 LogSumExp 预测
                 logits_dyn = cond_o_logits + verb_logits.unsqueeze(-1)  
                 logits_sta = cond_v_logits.transpose(1, 2) + obj_logits.unsqueeze(1) 
                 pred_com_logits = torch.logsumexp(torch.stack([logits_dyn, logits_sta], dim=0), dim=0)
 
                 # -------------------------------------------------------------------
-                # 第六步准备：分发预测结果至 Loss 模块统一优化
+                # 第六步：分发预测结果
                 # -------------------------------------------------------------------
                 if self.training:
                     batch_comp_tokens = self.comp_tokens[pairs]
@@ -370,7 +359,6 @@ class CustomCLIP(nn.Module):
                     batch_comp_text_features = self.c2c_text_c(batch_comp_text_features)
 
                     with torch.cuda.amp.autocast(enabled=False):
-                        # 文本也一次性直达双曲最深层级
                         t_c_feat_fp32 = clip_by_norm(batch_comp_text_features.float() * t_scale * d_m, MAX_R)
                         t_c_hyp_batch = exp_map0(t_c_feat_fp32, curv=c_fp32)
 
@@ -385,7 +373,6 @@ class CustomCLIP(nn.Module):
                         'v_c_hyp': v_c_hyp, 't_v_hyp': t_v_hyp_batch, 't_o_hyp': t_o_hyp_batch,
                         't_c_hyp': t_c_hyp_batch, 'coarse_v_hyp': coarse_v_hyp_batch, 'coarse_o_hyp': coarse_o_hyp_batch,
                         
-                        # 向外输送新增的 Flow 与 Leakage 信号
                         'flow_pred_v': pred_v_flow, 'flow_target_v': flow_target_v,
                         'flow_pred_o': pred_o_flow, 'flow_target_o': flow_target_o,
                         'leak_v_logits': leak_v_logits, 'leak_o_logits': leak_o_logits
@@ -397,7 +384,7 @@ class CustomCLIP(nn.Module):
 
             else:
                 # ====================================================================
-                # 【原生欧氏 C2C Vanilla】 如果开关关闭，这里绝对不变，完全保留原生逻辑
+                # 原生欧氏 C2C Vanilla 
                 # ====================================================================
                 cond_v_euc, cond_o_euc = self.condition_module_hyperbolic(
                     v_feat_c.float(), o_feat_c.float(), verb_text_fp32, obj_text_fp32, n_o, b, feat_dim_c, n_v
@@ -456,9 +443,9 @@ def build_model(train_dataset, cfg):
         elif 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
-        elif 'c2c' in name or name in ['visual_scale', 'text_scale', 'cls_temp', 'd_coarse', 'd_fine', 'd_comp']:
+        # 【重大修复】：把 'c' 加回了白名单，允许自适应曲率优化！
+        elif 'c2c' in name or name in ['visual_scale', 'text_scale', 'cls_temp', 'c', 'd_coarse', 'd_fine', 'd_comp']:
             param.requires_grad = True
-        # 释放我们新增的两个 Flow 专用的权重用于反向传播！
         elif 'flow_pred' in name or 'composer' in name:
             param.requires_grad = True
     return model

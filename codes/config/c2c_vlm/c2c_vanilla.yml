@@ -76,7 +76,7 @@ train:
   w_dal: 1.0   #判别对齐损失权重
   w_hem: 0.1   #层次蕴含  
   w_flow: 1.0     #欧氏流匹配权重
-  w_leak: 0.5    #泄露
+  w_leak: 0.0    #泄露
   use_hyperbolic: True
 
 test:
